@@ -669,9 +669,12 @@ do_self_update() {
         log "  sing-box: v$CURRENT_VER (up to date)"
     fi
 
-    # 4. Update domain lists
+    # 4. Update domain lists (force: self-update is an explicit "refresh
+    #    everything", and it must bypass the version-check so a user whose
+    #    .lists-version is stuck on a previously-broken download gets a clean
+    #    re-download instead of a short-circuit)
     log "  Updating domain lists..."
-    sh "$UPDATE_SCRIPT"
+    sh "$UPDATE_SCRIPT" --force
 
     # 5. Restart if running
     if pidof sing-box >/dev/null 2>&1; then
