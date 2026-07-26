@@ -165,6 +165,7 @@ File: `/opt/etc/hysteria-keenetic/config`
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `ROUTE_MODE` | `selective` | `selective` = only blocked domains via VPN; `all` = all traffic via VPN |
+| `FULL_VPN_DEVICES` | *(empty)* | Comma-separated LAN devices (MAC or IP) routed fully through VPN regardless of `ROUTE_MODE` |
 | `FORCE_DNS` | `1` | Block DoH/DoT to prevent DNS bypass |
 | `LAN_IF` | `br0` | LAN interface |
 | `DNSMASQ_PORT` | `5300` | dnsmasq port |
@@ -219,6 +220,17 @@ ROUTE_MODE=all
 ```
 
 In `all` mode, the VPN server IP and private networks (10.x, 192.168.x, etc.) are automatically excluded to prevent routing loops. Useful when you want all your traffic to appear from the VPN location.
+
+### Per-device full VPN routing (FULL_VPN_DEVICES)
+
+To route **all** traffic from specific devices (e.g. a smart TV or console) through the VPN while keeping the rest of the LAN selective, list them in `FULL_VPN_DEVICES` (comma-separated). Each entry is a MAC address (recommended — survives DHCP IP changes) or an IP:
+
+```
+FULL_VPN_DEVICES="54:b7:bd:60:09:64"
+FULL_VPN_DEVICES="54:b7:bd:60:09:64,192.168.1.50"
+```
+
+These devices bypass the domain list entirely — every connection they make goes through the tunnel. LAN-local and VPN-server traffic still stays direct (no routing loops), and DNS is still handled by the local resolver. Find a device's MAC in the Keenetic web UI (device list) or with `cat /proc/net/arp` over SSH. Restart the service after changing it: `hysteria-keenetic restart`.
 
 ### Updating
 
