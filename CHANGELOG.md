@@ -38,5 +38,16 @@
   This is what lets the OOM fix above actually reach installed routers.
 
 ### Added
+- **Per-device full VPN routing (`FULL_VPN_DEVICES`).** A comma-separated list of
+  LAN devices (by MAC — recommended — or IP) whose *entire* traffic is routed
+  through the tunnel regardless of `ROUTE_MODE`, while the rest of the LAN stays
+  selective. Useful for a smart TV or console that should always go through the
+  VPN. Implemented as source-matched PREROUTING jumps (bypassing the ipset dst
+  match) into the existing REDIRECT/TPROXY chains, with DNS (port 53) excluded so
+  forced-DNS still applies. The chains' private-net + server-IP RETURN guards
+  (previously only added in `ROUTE_MODE=all`) are now also added whenever
+  `FULL_VPN_DEVICES` is set, so the device's LAN and VPN-server traffic stays
+  direct and no routing loop forms. `do_stop` removes these jumps before deleting
+  the chains, and `manage.sh status` lists the configured devices.
 - `manage.sh status` now reports `/tmp` (RAM tmpfs) usage and warns at ≥80 %, so a
   filling tmpfs is visible before it causes an OOM.
