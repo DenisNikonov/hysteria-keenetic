@@ -25,6 +25,7 @@ FWMARK="${FWMARK:-2}"
 ROUTE_TABLE="${ROUTE_TABLE:-101}"
 FORCE_DNS="${FORCE_DNS:-1}"
 ROUTE_MODE="${ROUTE_MODE:-selective}"
+FULL_VPN_DEVICES="${FULL_VPN_DEVICES:-}"
 
 SINGBOX_BIN="/opt/bin/sing-box"
 SINGBOX_CONF="$BASE_DIR/sing-box.json"
@@ -99,6 +100,34 @@ _get_server_ip() {
     fi
 }
 
+# True when whole-device traffic is routed (ROUTE_MODE=all or FULL_VPN_DEVICES).
+# Such rules bypass the ipset dst match, so the chains need private-net +
+# server-IP RETURN guards to keep LAN/server traffic direct and avoid loops.
+_need_loop_guards() {
+    [ "$ROUTE_MODE" = "all" ] || [ -n "$FULL_VPN_DEVICES" ]
+}
+
+# Add/remove PREROUTING jumps that route ALL traffic from specific LAN devices
+# (matched by MAC or source IP) into a tunnel chain, bypassing the ipset dst
+# match. DNS (dport 53) is excluded so our dnsmasq/force-DNS still applies.
+#   _full_device_rules <add|del> <table> <proto> <chain>
+_full_device_rules() {
+    _fdr_action=$1; _fdr_table=$2; _fdr_proto=$3; _fdr_chain=$4
+    [ -n "$FULL_VPN_DEVICES" ] || return 0
+    echo "$FULL_VPN_DEVICES" | tr ',' '\n' | while read -r _dev; do
+        _dev=$(echo "$_dev" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -n "$_dev" ] || continue
+        case "$_dev" in
+            *:*:*) _match="-m mac --mac-source $_dev" ;;
+            *)     _match="-s $_dev" ;;
+        esac
+        # word-splitting on $_match is intentional (MAC/IP, no spaces)
+        iptables -t "$_fdr_table" -D PREROUTING -i "$LAN_IF" $_match -p "$_fdr_proto" ! --dport 53 -j "$_fdr_chain" 2>/dev/null
+        [ "$_fdr_action" = "add" ] && \
+            iptables -t "$_fdr_table" -I PREROUTING 1 -i "$LAN_IF" $_match -p "$_fdr_proto" ! --dport 53 -j "$_fdr_chain"
+    done
+}
+
 # ── iptables setup (used by start and netfilter.d hook) ──────────
 
 setup_iptables() {
@@ -106,8 +135,8 @@ setup_iptables() {
     iptables -t nat -N HYSTERIA_REDIRECT 2>/dev/null
     iptables -t nat -F HYSTERIA_REDIRECT
 
-    # VPN server RETURN (prevent routing loops in "all" mode)
-    if [ "$ROUTE_MODE" = "all" ]; then
+    # VPN server RETURN (prevent routing loops for whole-device routing)
+    if _need_loop_guards; then
         _server_ip=$(_get_server_ip)
         if [ -n "$_server_ip" ]; then
             iptables -t nat -A HYSTERIA_REDIRECT -d "$_server_ip" -j RETURN
@@ -133,8 +162,8 @@ setup_iptables() {
     iptables -t mangle -N HYSTERIA_TPROXY 2>/dev/null
     iptables -t mangle -F HYSTERIA_TPROXY
 
-    # VPN server RETURN (prevent routing loops in "all" mode)
-    if [ "$ROUTE_MODE" = "all" ]; then
+    # VPN server RETURN (prevent routing loops for whole-device routing)
+    if _need_loop_guards; then
         _server_ip=${_server_ip:-$(_get_server_ip)}
         if [ -n "$_server_ip" ]; then
             iptables -t mangle -A HYSTERIA_TPROXY -d "$_server_ip" -j RETURN
@@ -170,6 +199,13 @@ setup_iptables() {
     iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT"
     # Legacy: remove old UDP REDIRECT if present
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
+
+    # === Per-device full VPN routing (FULL_VPN_DEVICES) ===
+    # Route ALL traffic from listed devices through the tunnel, bypassing the
+    # ipset dst match. DNS (dport 53) excluded so our dnsmasq still applies.
+    # Loop guards (server-IP + private-net RETURN) added to the chains above.
+    _full_device_rules add nat tcp HYSTERIA_REDIRECT
+    _full_device_rules add mangle udp HYSTERIA_TPROXY
 
     # === Force DNS (block DoH/DoT) ===
     if [ "$FORCE_DNS" = "1" ]; then
@@ -484,6 +520,11 @@ SINGBOX_EOF
 do_stop() {
     log "Stopping hysteria-keenetic..."
 
+    # Per-device full-routing jumps — remove before flushing/deleting chains
+    # (chain -X fails while a PREROUTING rule still references it)
+    _full_device_rules del nat tcp HYSTERIA_REDIRECT
+    _full_device_rules del mangle udp HYSTERIA_TPROXY
+
     # TCP REDIRECT cleanup (nat table) — both selective and all variants
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
@@ -725,6 +766,9 @@ do_status() {
         echo "  mode:         ALL traffic through VPN"
     else
         echo "  mode:         selective (ipset-matched only)"
+    fi
+    if [ -n "$FULL_VPN_DEVICES" ]; then
+        echo "  full-VPN dev: $FULL_VPN_DEVICES"
     fi
     if iptables -t nat -L HYSTERIA_REDIRECT -n >/dev/null 2>&1; then
         REDIR_PKTS=$(iptables -t nat -L HYSTERIA_REDIRECT -n -v 2>&1 | grep "REDIRECT" | awk '{sum+=$1} END {print sum+0}')

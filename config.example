@@ -18,6 +18,15 @@ SERVICES="Antifilter community edition,ITDog Inside,Youtube,Google,Facebook,Tik-
 # "all" — ALL traffic goes through VPN (except local network and VPN server).
 ROUTE_MODE="selective"
 
+# ── Per-device full VPN routing ──────────────────────────────────
+# Comma-separated list of LAN devices whose ENTIRE traffic goes through the
+# VPN, regardless of ROUTE_MODE (the rest of the LAN stays selective).
+# Each entry is a MAC address (recommended — survives DHCP IP changes) or an
+# IP address. Example: a smart TV that should always route through the VPN.
+#   FULL_VPN_DEVICES="54:b7:bd:60:09:64"
+#   FULL_VPN_DEVICES="54:b7:bd:60:09:64,192.168.1.50"
+FULL_VPN_DEVICES=""
+
 # ── Network ──────────────────────────────────────────────────────
 LAN_IF="br0"
 DNSMASQ_PORT=5300
