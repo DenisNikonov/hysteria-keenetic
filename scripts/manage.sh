@@ -12,6 +12,7 @@ PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:
 BASE_DIR="/opt/etc/hysteria-keenetic"
 CONFIG="$BASE_DIR/config"
 IPSET_NAME="unblock"
+RU_IPSET_NAME="ru_direct"
 DNSMASQ_PID_FILE="/tmp/hysteria-dnsmasq.pid"
 
 # Load config
@@ -21,6 +22,8 @@ DNSMASQ_PID_FILE="/tmp/hysteria-dnsmasq.pid"
 # Defaults for optional config values
 DNSMASQ_PORT="${DNSMASQ_PORT:-5300}"
 LAN_IF="${LAN_IF:-br0}"
+# LAN_IF may list several interfaces, e.g. "br0,nwg6" (WireGuard server for remote clients)
+LAN_IFS=$(echo "$LAN_IF" | tr ',' ' ')
 FWMARK="${FWMARK:-2}"
 ROUTE_TABLE="${ROUTE_TABLE:-101}"
 FORCE_DNS="${FORCE_DNS:-1}"
@@ -39,6 +42,7 @@ DNSCRYPT_BIN="/opt/sbin/dnscrypt-proxy"
 DNSCRYPT_CONF="/opt/etc/dnscrypt-proxy.toml"
 DNSCRYPT_PORT=5301
 UPDATE_SCRIPT="$BASE_DIR/scripts/update-domains.sh"
+RU_IPS_FILE="$BASE_DIR/ru-ips.lst"
 
 log() { logger -s -t "hysteria-keenetic" "$1"; }
 
@@ -100,11 +104,41 @@ _get_server_ip() {
     fi
 }
 
-# True when whole-device traffic is routed (ROUTE_MODE=all or FULL_VPN_DEVICES).
+# True when whole-device traffic is routed (ROUTE_MODE=all/except-ru or FULL_VPN_DEVICES).
 # Such rules bypass the ipset dst match, so the chains need private-net +
 # server-IP RETURN guards to keep LAN/server traffic direct and avoid loops.
 _need_loop_guards() {
-    [ "$ROUTE_MODE" = "all" ] || [ -n "$FULL_VPN_DEVICES" ]
+    [ "$ROUTE_MODE" = "all" ] || [ "$ROUTE_MODE" = "except-ru" ] || [ -n "$FULL_VPN_DEVICES" ]
+}
+
+# True when ROUTE_MODE=except-ru and the RU ipset is loaded. Without the set
+# the "! --match-set" rule cannot be added, so we degrade to selective mode.
+_ru_direct_ready() {
+    [ "$ROUTE_MODE" = "except-ru" ] && [ "$(_ru_count)" -gt 0 ]
+}
+
+# Keenetic's ipset prints no "Number of entries" header, so count member lines
+_ru_count() {
+    ipset list "$RU_IPSET_NAME" 2>/dev/null | grep -cE '^[0-9]'
+}
+
+# Load RU CIDRs from $RU_IPS_FILE into the RU ipset (atomic swap when the
+# set already exists, so a reload never leaves it half-empty)
+_load_ru_ipset() {
+    [ -s "$RU_IPS_FILE" ] || return 1
+    ipset destroy "${RU_IPSET_NAME}_new" 2>/dev/null
+    ipset create "${RU_IPSET_NAME}_new" hash:net maxelem 65536 || return 1
+    if ! awk -v s="${RU_IPSET_NAME}_new" '/^[0-9]/{print "add " s " " $0}' "$RU_IPS_FILE" | ipset restore -exist; then
+        ipset destroy "${RU_IPSET_NAME}_new"
+        return 1
+    fi
+    # first load: rename; reload: swap under live rules
+    if ipset list "$RU_IPSET_NAME" -t >/dev/null 2>&1; then
+        ipset swap "${RU_IPSET_NAME}_new" "$RU_IPSET_NAME"
+        ipset destroy "${RU_IPSET_NAME}_new"
+    else
+        ipset rename "${RU_IPSET_NAME}_new" "$RU_IPSET_NAME"
+    fi
 }
 
 # Add/remove PREROUTING jumps that route ALL traffic from specific LAN devices
@@ -131,7 +165,7 @@ _full_device_rules() {
 # ── iptables setup (used by start and netfilter.d hook) ──────────
 
 setup_iptables() {
-    # === TCP: REDIRECT to sing-box (nat PREROUTING) ===
+    # === TCP: REDIRECT to sing-box (nat) ===
     iptables -t nat -N HYSTERIA_REDIRECT 2>/dev/null
     iptables -t nat -F HYSTERIA_REDIRECT
 
@@ -147,17 +181,7 @@ setup_iptables() {
 
     iptables -t nat -A HYSTERIA_REDIRECT -p tcp -j REDIRECT --to-ports "$REDIRECT_PORT"
 
-    # Remove both selective and all variants before inserting
-    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
-    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
-
-    if [ "$ROUTE_MODE" = "all" ]; then
-        iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT
-    else
-        iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT
-    fi
-
-    # === UDP: TPROXY to sing-box (mangle PREROUTING) ===
+    # === UDP: TPROXY to sing-box (mangle) ===
     load_tproxy_modules
     iptables -t mangle -N HYSTERIA_TPROXY 2>/dev/null
     iptables -t mangle -F HYSTERIA_TPROXY
@@ -174,20 +198,57 @@ setup_iptables() {
 
     iptables -t mangle -A HYSTERIA_TPROXY -p udp -j TPROXY --on-port "$TPROXY_PORT" --tproxy-mark "0x$FWMARK/0x$FWMARK"
 
-    # Remove both selective and all variants before inserting
-    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_TPROXY 2>/dev/null
-    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY 2>/dev/null
-
-    if [ "$ROUTE_MODE" = "all" ]; then
-        iptables -t mangle -I PREROUTING 1 -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY
-    else
-        iptables -t mangle -I PREROUTING 1 -i "$LAN_IF" -p udp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_TPROXY
-    fi
-
     # Policy routing for TPROXY
     ip rule del fwmark "0x$FWMARK" table "$ROUTE_TABLE" 2>/dev/null
     ip rule add fwmark "0x$FWMARK" table "$ROUTE_TABLE"
     ip route replace local default dev lo table "$ROUTE_TABLE"
+
+    if [ "$FORCE_DNS" = "1" ]; then
+        ipset create force_dns hash:ip 2>/dev/null
+        ipset flush force_dns 2>/dev/null
+        for ip in \
+            8.8.8.8 8.8.4.4 \
+            1.1.1.1 1.0.0.1 \
+            9.9.9.9 149.112.112.112 \
+            208.67.222.222 208.67.220.220 \
+            94.140.14.14 94.140.15.15 \
+            185.228.168.9 185.228.169.9; do
+            ipset add force_dns "$ip" 2>/dev/null
+        done
+    fi
+
+    for LAN_IF in $LAN_IFS; do _add_lan_rules; done
+}
+
+# PREROUTING/FORWARD rules for one LAN interface ($LAN_IF)
+_add_lan_rules() {
+    # TCP jump — remove all mode variants before inserting
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
+
+    if [ "$ROUTE_MODE" = "all" ]; then
+        iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT
+    else
+        # except-ru: everything outside RU goes to the tunnel; the unblock
+        # jump below still wins for listed services that resolve to RU IPs
+        _ru_direct_ready && \
+            iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_REDIRECT
+        iptables -t nat -I PREROUTING 1 -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT
+    fi
+
+    # UDP jump — remove all mode variants before inserting
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_TPROXY 2>/dev/null
+
+    if [ "$ROUTE_MODE" = "all" ]; then
+        iptables -t mangle -I PREROUTING 1 -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY
+    else
+        _ru_direct_ready && \
+            iptables -t mangle -I PREROUTING 1 -i "$LAN_IF" -p udp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_TPROXY
+        iptables -t mangle -I PREROUTING 1 -i "$LAN_IF" -p udp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_TPROXY
+    fi
 
     # === DNS: intercept LAN DNS queries ===
     # UDP DNS: use TPROXY to sing-box (works for any destination IP; nat REDIRECT
@@ -209,18 +270,6 @@ setup_iptables() {
 
     # === Force DNS (block DoH/DoT) ===
     if [ "$FORCE_DNS" = "1" ]; then
-        ipset create force_dns hash:ip 2>/dev/null
-        ipset flush force_dns 2>/dev/null
-        for ip in \
-            8.8.8.8 8.8.4.4 \
-            1.1.1.1 1.0.0.1 \
-            9.9.9.9 149.112.112.112 \
-            208.67.222.222 208.67.220.220 \
-            94.140.14.14 94.140.15.15 \
-            185.228.168.9 185.228.169.9; do
-            ipset add force_dns "$ip" 2>/dev/null
-        done
-
         iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null
         iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j REJECT 2>/dev/null
         iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j DROP 2>/dev/null
@@ -322,6 +371,16 @@ _start_internal() {
     fi
     [ "$LOADED" -gt 0 ] && log "  ipset: pre-loaded $LOADED static IPs/CIDRs"
 
+    # ── 3b. RU direct list (ROUTE_MODE=except-ru) ──
+    if [ "$ROUTE_MODE" = "except-ru" ]; then
+        [ -s "$RU_IPS_FILE" ] || sh "$UPDATE_SCRIPT" --ru-only
+        if _load_ru_ipset; then
+            log "  ipset: $RU_IPSET_NAME loaded ($(_ru_count) RU CIDRs)"
+        else
+            log "  ipset: WARNING — no RU list, falling back to selective routing"
+        fi
+    fi
+
     # ── 4. Update domains (downloads lists, generates dnsmasq config) ──
     if [ ! -f "$BASE_DIR/dnsmasq-ipset.conf" ] || [ ! -s "$BASE_DIR/dnsmasq-ipset.conf" ]; then
         log "  domains: downloading..."
@@ -393,6 +452,8 @@ _start_internal() {
     IPCOUNT=$(ipset list "$IPSET_NAME" 2>/dev/null | tail -n +8 | wc -l)
     if [ "$ROUTE_MODE" = "all" ]; then
         log "Started. Mode: ALL traffic through VPN. TCP via REDIRECT, UDP via TPROXY."
+    elif _ru_direct_ready; then
+        log "Started. Mode: except-ru (RU direct, rest via VPN). TCP via REDIRECT, UDP via TPROXY."
     else
         log "Started. Mode: selective. $IPCOUNT IPs in ipset. TCP via REDIRECT, UDP via TPROXY."
     fi
@@ -515,48 +576,26 @@ _generate_singbox_config() {
 SINGBOX_EOF
 }
 
-# ── Stop ─────────────────────────────────────────────────────────
-
-do_stop() {
-    log "Stopping hysteria-keenetic..."
-
-    # Per-device full-routing jumps — remove before flushing/deleting chains
-    # (chain -X fails while a PREROUTING rule still references it)
+# Remove all PREROUTING/FORWARD rules for one LAN interface ($LAN_IF),
+# including legacy variants from older versions
+_del_lan_rules() {
     _full_device_rules del nat tcp HYSTERIA_REDIRECT
     _full_device_rules del mangle udp HYSTERIA_TPROXY
 
-    # TCP REDIRECT cleanup (nat table) — both selective and all variants
+    # TCP/UDP jumps — both selective and all variants
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
-    iptables -t nat -F HYSTERIA_REDIRECT 2>/dev/null
-    iptables -t nat -X HYSTERIA_REDIRECT 2>/dev/null
-
-    # UDP TPROXY cleanup (mangle table) — both selective and all variants
     iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -m set --match-set "$IPSET_NAME" dst -j HYSTERIA_TPROXY 2>/dev/null
     iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY 2>/dev/null
-    iptables -t mangle -F HYSTERIA_TPROXY 2>/dev/null
-    iptables -t mangle -X HYSTERIA_TPROXY 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -m set ! --match-set "$RU_IPSET_NAME" dst -j HYSTERIA_TPROXY 2>/dev/null
 
-    # Policy routing cleanup (for TPROXY)
-    ip rule del fwmark "0x$FWMARK" table "$ROUTE_TABLE" 2>/dev/null
-    ip route del local default dev lo table "$ROUTE_TABLE" 2>/dev/null
-
-    # Legacy TUN cleanup (from previous version)
+    # Legacy TUN
     iptables -t mangle -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -j HYSTERIA 2>/dev/null
-    iptables -t mangle -F HYSTERIA 2>/dev/null
-    iptables -t mangle -X HYSTERIA 2>/dev/null
-    iptables -t nat -D POSTROUTING -o tun0 -j RETURN 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -o tun0 -j ACCEPT 2>/dev/null
     iptables -D FORWARD -i tun0 -o "$LAN_IF" -j ACCEPT 2>/dev/null
-    ip route del default dev tun0 table "$ROUTE_TABLE" 2>/dev/null
 
-    # Legacy old TPROXY cleanup (from Hysteria version)
-    ip rule del fwmark 0x1 table 100 2>/dev/null
-    ip route del local default dev lo table 100 2>/dev/null
-
-    log "  iptables: redirect/tproxy cleaned"
-
-    # DoH/DoT blocking cleanup (both REJECT and legacy DROP variants)
+    # DoH/DoT blocking (both REJECT and legacy DROP variants)
     iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j REJECT 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j DROP 2>/dev/null
@@ -565,20 +604,56 @@ do_stop() {
     iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j REJECT 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
-    ipset destroy force_dns 2>/dev/null
 
-    # DNS intercept cleanup
+    # DNS intercept (+ legacy UDP REDIRECT)
     iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j TPROXY --on-port "$DNS_TPROXY_PORT" --tproxy-mark "0x$FWMARK/0x$FWMARK" 2>/dev/null
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
-    # Legacy: old UDP REDIRECT
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
 
-    # Legacy redsocks cleanup (from older versions)
+    # Legacy redsocks
     iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j REDSOCKS 2>/dev/null
-    iptables -t nat -F REDSOCKS 2>/dev/null
-    iptables -t nat -X REDSOCKS 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set "$IPSET_NAME" dst -j DROP 2>/dev/null
     iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null
+}
+
+# ── Stop ─────────────────────────────────────────────────────────
+
+do_stop() {
+    log "Stopping hysteria-keenetic..."
+
+    # Per-interface jumps — remove before flushing/deleting chains
+    # (chain -X fails while a PREROUTING rule still references it)
+    for LAN_IF in $LAN_IFS; do _del_lan_rules; done
+
+    # TCP REDIRECT cleanup (nat table)
+    iptables -t nat -F HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -X HYSTERIA_REDIRECT 2>/dev/null
+
+    # UDP TPROXY cleanup (mangle table)
+    iptables -t mangle -F HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -X HYSTERIA_TPROXY 2>/dev/null
+
+    # Policy routing cleanup (for TPROXY)
+    ip rule del fwmark "0x$FWMARK" table "$ROUTE_TABLE" 2>/dev/null
+    ip route del local default dev lo table "$ROUTE_TABLE" 2>/dev/null
+
+    # Legacy TUN cleanup (from previous version)
+    iptables -t mangle -F HYSTERIA 2>/dev/null
+    iptables -t mangle -X HYSTERIA 2>/dev/null
+    iptables -t nat -D POSTROUTING -o tun0 -j RETURN 2>/dev/null
+    ip route del default dev tun0 table "$ROUTE_TABLE" 2>/dev/null
+
+    # Legacy old TPROXY cleanup (from Hysteria version)
+    ip rule del fwmark 0x1 table 100 2>/dev/null
+    ip route del local default dev lo table 100 2>/dev/null
+
+    log "  iptables: redirect/tproxy cleaned"
+
+    ipset destroy force_dns 2>/dev/null
+
+    # Legacy redsocks cleanup (from older versions)
+    iptables -t nat -F REDSOCKS 2>/dev/null
+    iptables -t nat -X REDSOCKS 2>/dev/null
 
     log "  iptables: cleaned"
 
@@ -591,6 +666,7 @@ do_stop() {
 
     # ipset (must be after iptables cleanup)
     ipset destroy "$IPSET_NAME" 2>/dev/null
+    ipset destroy "$RU_IPSET_NAME" 2>/dev/null
     log "  ipset: destroyed"
 
     # dnscrypt-proxy
@@ -764,6 +840,8 @@ do_status() {
     echo "  ---------------"
     if [ "$ROUTE_MODE" = "all" ]; then
         echo "  mode:         ALL traffic through VPN"
+    elif _ru_direct_ready; then
+        echo "  mode:         except-ru (RU direct, rest via VPN; $(_ru_count) RU CIDRs)"
     else
         echo "  mode:         selective (ipset-matched only)"
     fi
@@ -831,8 +909,10 @@ do_status() {
     # DNS encryption blocking
     echo "  DNS encryption blocking"
     echo "  -----------------------"
-    if iptables -C FORWARD -i "$LAN_IF" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null \
-       || iptables -C FORWARD -i "$LAN_IF" -p tcp --dport 853 -j DROP 2>/dev/null; then
+    # rules are identical on every LAN_IF, checking the first one is enough
+    _if=${LAN_IFS%% *}
+    if iptables -C FORWARD -i "$_if" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null \
+       || iptables -C FORWARD -i "$_if" -p tcp --dport 853 -j DROP 2>/dev/null; then
         DOH_IPS=$(ipset list force_dns 2>/dev/null | tail -n +8 | wc -l)
         echo "  DoT block: enabled (port 853 rejected)"
         echo "  DoH block: enabled ($DOH_IPS provider IPs rejected)"

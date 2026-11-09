@@ -16,6 +16,8 @@ SERVICES="Antifilter community edition,ITDog Inside,Youtube,Google,Facebook,Tik-
 # ── Routing mode ──────────────────────────────────────────────────
 # "selective" — only traffic to domains in your service lists goes through VPN.
 # "all" — ALL traffic goes through VPN (except local network and VPN server).
+# "except-ru" — traffic to Russian IPs goes direct, everything else via VPN.
+#   Domains from your service lists still go via VPN even on RU IPs.
 ROUTE_MODE="selective"
 
 # ── Per-device full VPN routing ──────────────────────────────────
@@ -28,6 +30,9 @@ ROUTE_MODE="selective"
 FULL_VPN_DEVICES=""
 
 # ── Network ──────────────────────────────────────────────────────
+# LAN interface(s). Comma-separated list to also route remote clients,
+# e.g. a Keenetic WireGuard/AmneziaWG server for a phone: LAN_IF="br0,nwg6"
+# (find the name with: ip -4 addr | grep nwg)
 LAN_IF="br0"
 DNSMASQ_PORT=5300
 

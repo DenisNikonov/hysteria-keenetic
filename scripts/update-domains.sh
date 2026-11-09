@@ -15,6 +15,12 @@ DNSMASQ_CONF="$BASE_DIR/dnsmasq.conf"
 DNSMASQ_PID_FILE="/tmp/hysteria-dnsmasq.pid"
 IPSET_NAME="unblock"
 VERSION_FILE="$BASE_DIR/.lists-version"
+RU_IPS_FILE="$BASE_DIR/ru-ips.lst"
+RU_IPSET_NAME="ru_direct"
+# Aggregated RU IPv4 CIDRs (RIR delegation data). ~8.7k lines as of 2026-11.
+RU_IPS_URLS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt
+https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+RU_IPS_MIN=5000
 
 log() { logger -s -t "hy-update" "$1"; }
 
@@ -63,6 +69,34 @@ get_upstream_url() {
     esac
 }
 
+# ── RU CIDR list for ROUTE_MODE=except-ru ────────────────────────
+# Keeps the previous list if every source fails or returns a suspiciously
+# short list (same reasoning as the domain sanity gate below).
+update_ru_ips() {
+    for _u in $RU_IPS_URLS; do
+        curl -sL -f -m 60 "$_u" 2>/dev/null \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' > "$RU_IPS_FILE.new"
+        _n=$(wc -l < "$RU_IPS_FILE.new")
+        if [ "$_n" -ge "$RU_IPS_MIN" ]; then
+            mv "$RU_IPS_FILE.new" "$RU_IPS_FILE"
+            log "RU IPs: $_n CIDRs ($_u)"
+            # Live reload with an atomic swap (manage.sh creates the set on start)
+            if ipset list "$RU_IPSET_NAME" -t >/dev/null 2>&1; then
+                ipset destroy "${RU_IPSET_NAME}_new" 2>/dev/null
+                ipset create "${RU_IPSET_NAME}_new" hash:net maxelem 65536 \
+                    && awk -v s="${RU_IPSET_NAME}_new" '{print "add " s " " $0}' "$RU_IPS_FILE" | ipset restore -exist \
+                    && ipset swap "${RU_IPSET_NAME}_new" "$RU_IPSET_NAME"
+                ipset destroy "${RU_IPSET_NAME}_new" 2>/dev/null
+            fi
+            return 0
+        fi
+        log "  ! RU IPs: $_u returned $_n CIDRs (min $RU_IPS_MIN)"
+    done
+    rm -f "$RU_IPS_FILE.new"
+    log "ERROR: RU IP list download failed — keeping previous list"
+    return 1
+}
+
 # ── Load config ──────────────────────────────────────────────────
 [ -f "$CONFIG" ] || { log "Error: config not found"; exit 1; }
 . "$CONFIG"
@@ -71,11 +105,20 @@ get_upstream_url() {
 LISTS_REPO="${LISTS_REPO:-denisnikonov/hysteria-keenetic}"
 LISTS_BASE_URL="https://github.com/$LISTS_REPO/releases/latest/download"
 
-# Parse --force flag
+# Parse flags
 _force=0
+_ru_only=0
 for _arg in "$@"; do
     [ "$_arg" = "--force" ] && _force=1
+    [ "$_arg" = "--ru-only" ] && _ru_only=1
 done
+
+# RU list is independent of the domain-list release version, so refresh it
+# before the version short-circuit below
+if [ "${ROUTE_MODE:-selective}" = "except-ru" ] || [ "$_ru_only" = "1" ]; then
+    update_ru_ips; _ru_rc=$?
+    [ "$_ru_only" = "1" ] && exit "$_ru_rc"
+fi
 
 # ── Version check (skip download if up to date) ─────────────────
 if [ "$_force" = "0" ]; then

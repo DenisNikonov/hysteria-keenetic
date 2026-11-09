@@ -47,67 +47,75 @@ LAN_IF="${LAN_IF:-br0}"
 
 log "Stopping services..."
 
-# Current: nat REDIRECT chain (TCP) — both selective and all variants
-iptables -t nat -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
-iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
-iptables -t nat -F HYSTERIA_REDIRECT 2>/dev/null
-iptables -t nat -X HYSTERIA_REDIRECT 2>/dev/null
-log "  iptables: nat/REDIRECT cleaned"
+# manage.sh stop knows every LAN_IF interface and FULL_VPN_DEVICES rules;
+# the manual cleanup below is a fallback for broken/partial installs
+[ -x "$INSTALL_DIR/scripts/manage.sh" ] && "$INSTALL_DIR/scripts/manage.sh" stop >/dev/null 2>&1
 
-# Current: mangle TPROXY chain (UDP) — both selective and all variants
-iptables -t mangle -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -p udp -j HYSTERIA_TPROXY 2>/dev/null
-iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY 2>/dev/null
-iptables -t mangle -F HYSTERIA_TPROXY 2>/dev/null
-iptables -t mangle -X HYSTERIA_TPROXY 2>/dev/null
-log "  iptables: mangle/TPROXY cleaned"
+# LAN_IF may be a comma-separated list. Chain -F/-X repeats per interface;
+# it only succeeds once the last interface's jumps are gone.
+for LAN_IF in $(echo "$LAN_IF" | tr ',' ' '); do
+    # Current: nat REDIRECT chain (TCP) — both selective and all variants
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -j HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -F HYSTERIA_REDIRECT 2>/dev/null
+    iptables -t nat -X HYSTERIA_REDIRECT 2>/dev/null
+    log "  iptables: nat/REDIRECT cleaned"
 
-# Current: TPROXY policy routing
-ip rule del fwmark "0x$FWMARK" table "$ROUTE_TABLE" 2>/dev/null
-ip route flush table "$ROUTE_TABLE" 2>/dev/null
-log "  policy routing: cleaned"
+    # Current: mangle TPROXY chain (UDP) — both selective and all variants
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -p udp -j HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp -j HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -F HYSTERIA_TPROXY 2>/dev/null
+    iptables -t mangle -X HYSTERIA_TPROXY 2>/dev/null
+    log "  iptables: mangle/TPROXY cleaned"
 
-# Legacy: mangle MARK chain (from TUN version)
-iptables -t mangle -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -j HYSTERIA 2>/dev/null
-iptables -t mangle -F HYSTERIA 2>/dev/null
-iptables -t mangle -X HYSTERIA 2>/dev/null
+    # Current: TPROXY policy routing
+    ip rule del fwmark "0x$FWMARK" table "$ROUTE_TABLE" 2>/dev/null
+    ip route flush table "$ROUTE_TABLE" 2>/dev/null
+    log "  policy routing: cleaned"
 
-# Legacy: TUN routing
-ip route del default dev tun0 table "$ROUTE_TABLE" 2>/dev/null
-iptables -t nat -D POSTROUTING -o tun0 -j RETURN 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -o tun0 -j ACCEPT 2>/dev/null
-iptables -D FORWARD -i tun0 -o "$LAN_IF" -j ACCEPT 2>/dev/null
+    # Legacy: mangle MARK chain (from TUN version)
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -m set --match-set "$IPSET_NAME" dst -j HYSTERIA 2>/dev/null
+    iptables -t mangle -F HYSTERIA 2>/dev/null
+    iptables -t mangle -X HYSTERIA 2>/dev/null
 
-# Legacy: old TPROXY (fwmark 0x1, table 100)
-ip rule del fwmark 0x1 table 100 2>/dev/null
-ip route del local default dev lo table 100 2>/dev/null
-log "  legacy rules: cleaned"
+    # Legacy: TUN routing
+    ip route del default dev tun0 table "$ROUTE_TABLE" 2>/dev/null
+    iptables -t nat -D POSTROUTING -o tun0 -j RETURN 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -o tun0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -i tun0 -o "$LAN_IF" -j ACCEPT 2>/dev/null
 
-# DoH/DoT blocking cleanup (both REJECT and legacy DROP variants)
-iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j REJECT 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j DROP 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j DROP 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 443 -m set --match-set force_dns dst -j REJECT --reject-with tcp-reset 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j REJECT 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
-ipset destroy force_dns 2>/dev/null
-log "  iptables: DoH/DoT blocking cleaned"
+    # Legacy: old TPROXY (fwmark 0x1, table 100)
+    ip rule del fwmark 0x1 table 100 2>/dev/null
+    ip route del local default dev lo table 100 2>/dev/null
+    log "  legacy rules: cleaned"
 
-# DNS intercept cleanup
-iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j TPROXY --on-port 5302 --tproxy-mark "0x$FWMARK/0x$FWMARK" 2>/dev/null
-iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
-# Legacy: old UDP REDIRECT
-iptables -t nat -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
-log "  iptables: DNS intercept cleaned"
+    # DoH/DoT blocking cleanup (both REJECT and legacy DROP variants)
+    iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j REJECT --reject-with tcp-reset 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j REJECT 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 853 -j DROP 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 853 -j DROP 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 443 -m set --match-set force_dns dst -j REJECT --reject-with tcp-reset 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j REJECT 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p tcp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set force_dns dst -j DROP 2>/dev/null
+    ipset destroy force_dns 2>/dev/null
+    log "  iptables: DoH/DoT blocking cleaned"
 
-# Legacy redsocks cleanup (from older versions)
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set "$IPSET_NAME" dst -j DROP 2>/dev/null
-iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null
-iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j REDSOCKS 2>/dev/null
-iptables -t nat -F REDSOCKS 2>/dev/null
-iptables -t nat -X REDSOCKS 2>/dev/null
-log "  iptables: legacy redsocks cleaned"
+    # DNS intercept cleanup
+    iptables -t mangle -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j TPROXY --on-port 5302 --tproxy-mark "0x$FWMARK/0x$FWMARK" 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
+    # Legacy: old UDP REDIRECT
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p udp --dport 53 -j REDIRECT --to-ports "$DNSMASQ_PORT" 2>/dev/null
+    log "  iptables: DNS intercept cleaned"
+
+    # Legacy redsocks cleanup (from older versions)
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -m set --match-set "$IPSET_NAME" dst -j DROP 2>/dev/null
+    iptables -D FORWARD -i "$LAN_IF" -p udp --dport 443 -j DROP 2>/dev/null
+    iptables -t nat -D PREROUTING -i "$LAN_IF" -p tcp -m set --match-set "$IPSET_NAME" dst -j REDSOCKS 2>/dev/null
+    iptables -t nat -F REDSOCKS 2>/dev/null
+    iptables -t nat -X REDSOCKS 2>/dev/null
+    log "  iptables: legacy redsocks cleaned"
+done
 
 # dnsmasq
 if [ -f "$DNSMASQ_PID_FILE" ]; then
@@ -118,6 +126,7 @@ log "  dnsmasq: stopped"
 
 # ipset
 ipset destroy "$IPSET_NAME" 2>/dev/null
+ipset destroy ru_direct 2>/dev/null
 log "  ipset: destroyed"
 
 # dnscrypt-proxy

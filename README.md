@@ -164,10 +164,10 @@ File: `/opt/etc/hysteria-keenetic/config`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `ROUTE_MODE` | `selective` | `selective` = only blocked domains via VPN; `all` = all traffic via VPN |
+| `ROUTE_MODE` | `selective` | `selective` = only blocked domains via VPN; `all` = all traffic via VPN; `except-ru` = Russian IPs direct, everything else via VPN |
 | `FULL_VPN_DEVICES` | *(empty)* | Comma-separated LAN devices (MAC or IP) routed fully through VPN regardless of `ROUTE_MODE` |
 | `FORCE_DNS` | `1` | Block DoH/DoT to prevent DNS bypass |
-| `LAN_IF` | `br0` | LAN interface |
+| `LAN_IF` | `br0` | LAN interface(s), comma-separated (e.g. `br0,nwg6` to also route clients of a Keenetic WireGuard server) |
 | `DNSMASQ_PORT` | `5300` | dnsmasq port |
 | `FWMARK` | `2` | Packet mark for UDP policy routing |
 | `ROUTE_TABLE` | `101` | Routing table |
@@ -220,6 +220,12 @@ ROUTE_MODE=all
 ```
 
 In `all` mode, the VPN server IP and private networks (10.x, 192.168.x, etc.) are automatically excluded to prevent routing loops. Useful when you want all your traffic to appear from the VPN location.
+
+`ROUTE_MODE=except-ru` is the inverse of `selective`: traffic to Russian IP addresses goes direct through your ISP, everything else goes through the VPN. Russian services that block foreign IPs (banks, Gosuslugi) keep seeing your home IP; foreign services see the VPS IP.
+
+- The RU list (~8.7k CIDRs) comes from [ipverse/rir-ip](https://github.com/ipverse/rir-ip) with [ipdeny](https://www.ipdeny.com/) as fallback, is stored in `ru-ips.lst` and refreshed by the domain update cron (`hysteria-keenetic update`). A failed or truncated download keeps the previous list.
+- Domains from `SERVICES` still go through VPN even when they resolve to Russian IPs (e.g. CDN caches inside Russian ISPs).
+- RU traffic never enters sing-box, so it keeps full speed. All foreign traffic goes through the router CPU and the VPS.
 
 ### Per-device full VPN routing (FULL_VPN_DEVICES)
 
